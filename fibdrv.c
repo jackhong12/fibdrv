@@ -6,6 +6,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/uaccess.h>
 
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
@@ -17,7 +18,7 @@ MODULE_VERSION("0.1");
 /* MAX_LENGTH is set to 92 because
  * ssize_t can't fit the number > 92
  */
-#define MAX_LENGTH 92
+#define MAX_LENGTH 93
 
 #define LONG_LONG_UPPER 0xFFFFFFFF00000000
 #define LONG_LONG_LOWER 0x00000000FFFFFFFF
@@ -28,7 +29,25 @@ struct BigN {
     unsigned long long lower, upper;
 };
 
-int bign_add(struct BigN *num1, struct BigN *num2, struct BigN *result)
+static void bign_divide(struct BigN *num,
+                        unsigned long long divisor,
+                        unsigned long long *remainder)
+{
+    if (!num->upper) {
+        *remainder = num->lower % divisor;
+        num->lower = num->lower / divisor;
+        return;
+    }
+
+    unsigned long long borrow = num->upper % divisor;
+    num->upper = num->upper / divisor;
+    *remainder = (LL_MAX % divisor) * borrow + borrow + num->lower % divisor;
+    num->lower = num->lower / divisor + (LL_MAX / divisor) * borrow +
+                 *remainder / divisor;
+    *remainder = *remainder % divisor;
+}
+
+static int bign_add(struct BigN *num1, struct BigN *num2, struct BigN *result)
 {
     unsigned long long tmp = 0;
     result->lower = num1->lower + num2->lower;
@@ -40,12 +59,40 @@ int bign_add(struct BigN *num1, struct BigN *num2, struct BigN *result)
     return 1;
 }
 
+static void bign2string(struct BigN *num, char *string)
+{
+    memset(string, 0, sizeof(char) * STRING_LEN);
+    unsigned long long remainder;
+    int ptr = 0;
+
+    if (!num->lower && !num->upper) {
+        string[0] = '0';
+        return;
+    }
+
+    while (num->lower || num->upper) {
+        bign_divide(num, 10, &remainder);
+        string[ptr++] = (unsigned char) (remainder) + 48;
+    }
+
+    /*
+     * Reverse string
+     */
+    --ptr;
+    for (int i = 0; i <= ptr / 2; ++i) {
+        char tmp;
+        tmp = string[i];
+        string[i] = string[ptr - i];
+        string[ptr - i] = tmp;
+    }
+}
+
 static dev_t fib_dev = 0;
 static struct cdev *fib_cdev;
 static struct class *fib_class;
 static DEFINE_MUTEX(fib_mutex);
 
-static long long fib_sequence(long long k)
+static void fib_sequence(long long k, char *string)
 {
     /* FIXME: use clz/ctz and fast algorithms to speed up */
     struct BigN f[k + 2];
@@ -59,7 +106,8 @@ static long long fib_sequence(long long k)
         bign_add(&f[i - 1], &f[i - 2], &f[i]);
     }
 
-    return f[k].lower;
+    bign2string(&f[k], string);
+    printk("%s\n", string);
 }
 
 static int fib_open(struct inode *inode, struct file *file)
@@ -83,7 +131,10 @@ static ssize_t fib_read(struct file *file,
                         size_t size,
                         loff_t *offset)
 {
-    return (ssize_t) fib_sequence(*offset);
+    char string[40];
+    fib_sequence(*offset, string);
+    copy_to_user(buf, string, 40);
+    return 0;
 }
 
 /* write operation is skipped */
