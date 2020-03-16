@@ -19,6 +19,27 @@ MODULE_VERSION("0.1");
  */
 #define MAX_LENGTH 92
 
+#define LONG_LONG_UPPER 0xFFFFFFFF00000000
+#define LONG_LONG_LOWER 0x00000000FFFFFFFF
+#define LL_MAX 0xFFFFFFFFFFFFFFFF
+#define STRING_LEN 40
+
+struct BigN {
+    unsigned long long lower, upper;
+};
+
+int bign_add(struct BigN *num1, struct BigN *num2, struct BigN *result)
+{
+    unsigned long long tmp = 0;
+    result->lower = num1->lower + num2->lower;
+    if (result->lower < num1->lower)
+        tmp = 1;
+    result->upper = num1->upper + num2->upper + tmp;
+    if (~num1->upper >= num2->upper + tmp && tmp && ~num2->upper)
+        return 0;
+    return 1;
+}
+
 static dev_t fib_dev = 0;
 static struct cdev *fib_cdev;
 static struct class *fib_class;
@@ -27,16 +48,18 @@ static DEFINE_MUTEX(fib_mutex);
 static long long fib_sequence(long long k)
 {
     /* FIXME: use clz/ctz and fast algorithms to speed up */
-    long long f[k + 2];
+    struct BigN f[k + 2];
 
-    f[0] = 0;
-    f[1] = 1;
+    f[0].lower = 0;
+    f[0].upper = 0;
+    f[1].lower = 1;
+    f[1].upper = 0;
 
     for (int i = 2; i <= k; i++) {
-        f[i] = f[i - 1] + f[i - 2];
+        bign_add(&f[i - 1], &f[i - 2], &f[i]);
     }
 
-    return f[k];
+    return f[k].lower;
 }
 
 static int fib_open(struct inode *inode, struct file *file)
