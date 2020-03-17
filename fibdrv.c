@@ -18,7 +18,7 @@ MODULE_VERSION("0.1");
 /* MAX_LENGTH is set to 92 because
  * ssize_t can't fit the number > 92
  */
-#define MAX_LENGTH 93
+#define MAX_LENGTH 100
 
 #define LONG_LONG_UPPER 0xFFFFFFFF00000000
 #define LONG_LONG_LOWER 0x00000000FFFFFFFF
@@ -47,6 +47,20 @@ static void bign_divide(struct BigN *num,
     *remainder = *remainder % divisor;
 }
 
+static int bign_minus(struct BigN *num1, struct BigN *num2, struct BigN *result)
+{
+    unsigned long long borrow = 0;
+    result->lower = num1->lower - num2->lower;
+    if (result->lower > num1->lower)
+        borrow = 1;
+
+    result->upper = num1->upper - num2->upper - borrow;
+
+    if (result->upper + borrow > num1->upper)
+        return 1;
+    return 0;
+}
+
 static int bign_add(struct BigN *num1, struct BigN *num2, struct BigN *result)
 {
     unsigned long long tmp = 0;
@@ -57,6 +71,77 @@ static int bign_add(struct BigN *num1, struct BigN *num2, struct BigN *result)
     if (~num1->upper >= num2->upper + tmp && tmp && ~num2->upper)
         return 0;
     return 1;
+}
+
+static int bign_left_shift(struct BigN *num, unsigned int size)
+{
+    unsigned long long mask = LL_MAX >> size;
+    num->upper = (num->upper << size) + ((~mask & num->lower) >> (64 - size));
+    num->lower = num->lower << size;
+
+    if (num->upper && size >= __builtin_clzll(num->upper))
+        return 1;
+    else if (size >= __builtin_clzll(num->lower) + 64)
+        return 1;
+    return 0;
+}
+
+static int long_long_multiple(unsigned long long num1,
+                              unsigned long long num2,
+                              struct BigN *result)
+{
+    unsigned long long u1, u2, l1, l2, z2, z1, z0, tmp, carry = 0;
+    u1 = (num1 & LONG_LONG_UPPER) >> 32;
+    u2 = (num2 & LONG_LONG_UPPER) >> 32;
+    l1 = num1 & LONG_LONG_LOWER;
+    l2 = num2 & LONG_LONG_LOWER;
+    z2 = u1 * u2;
+    z0 = l1 * l2;
+    tmp = u1 * l2;
+    z1 = u2 * l1;
+    z1 += tmp;
+    if (z1 < tmp)
+        carry = 1;
+
+    carry = 0;
+    struct BigN bign1 = {.upper = z2, .lower = z0};
+    struct BigN bign2 = {
+        .upper = ((z1 & LONG_LONG_UPPER) >> 32) + (carry << 32),
+        .lower = (z1 & LONG_LONG_LOWER) << 32};
+    return bign_add(&bign1, &bign2, result);
+}
+
+/*
+ * Multiple two BigN numbers. If the value of multipling is bigger than 128
+ * bits, return 1.
+ */
+int bign_multiple(struct BigN *num1, struct BigN *num2, struct BigN *result)
+{
+    /* overflow */
+    if (num1->upper && num2->upper)
+        return 1;
+
+    struct BigN tmp;
+    memset(&tmp, 0, sizeof(struct BigN));
+    long_long_multiple(num1->lower, num2->lower, result);
+
+    if (num1->upper)
+        long_long_multiple(num1->upper, num2->lower, &tmp);
+    else if (num2->upper)
+        long_long_multiple(num2->upper, num1->lower, &tmp);
+    else
+        return 0;
+
+    /* overflow */
+    if (tmp.upper)
+        return 1;
+
+    result->upper += tmp.lower;
+    /* overflow */
+    if (result->upper < tmp.lower)
+        return 1;
+
+    return 0;
 }
 
 static void bign2string(struct BigN *num, char *string)
@@ -91,23 +176,46 @@ static dev_t fib_dev = 0;
 static struct cdev *fib_cdev;
 static struct class *fib_class;
 static DEFINE_MUTEX(fib_mutex);
+static DEFINE_MUTEX(cal_mutex);
 
 static void fib_sequence(long long k, char *string)
 {
-    /* FIXME: use clz/ctz and fast algorithms to speed up */
-    struct BigN f[k + 2];
+    int j = 0;
+    if (k == 0) {
+        string[0] = '0';
+        string[1] = '\0';
 
+        return;
+    }
+
+    string[0] = '\0';
+    struct BigN f[k + 2];
     f[0].lower = 0;
     f[0].upper = 0;
     f[1].lower = 1;
     f[1].upper = 0;
+    unsigned long long mask = 0x8000000000000000;
+    for (int i = __builtin_clzll(k); i < 64; ++i) {
+        struct BigN tmp1, tmp2;
+        /* f[2j] */
+        tmp1.upper = f[j + 1].upper;
+        tmp1.lower = f[j + 1].lower;
+        bign_left_shift(&tmp1, 1);
+        bign_minus(&tmp1, &f[j], &tmp2);
+        bign_multiple(&tmp2, &f[j], &f[2 * j]);
 
-    for (int i = 2; i <= k; i++) {
-        bign_add(&f[i - 1], &f[i - 2], &f[i]);
+        /* f[2j + 1] */
+        bign_multiple(&f[j], &f[j], &tmp1);
+        bign_multiple(&f[j + 1], &f[j + 1], &tmp2);
+        bign_add(&tmp1, &tmp2, &f[2 * j + 1]);
+        j = j * 2;
+        if ((mask >> i) & k) {
+            bign_add(&f[j], &f[j + 1], &f[j + 2]);
+            ++j;
+        }
     }
 
-    bign2string(&f[k], string);
-    printk("%s\n", string);
+    bign2string(&f[j], string);
 }
 
 static int fib_open(struct inode *inode, struct file *file)
@@ -183,6 +291,7 @@ static int __init init_fib_dev(void)
     int rc = 0;
 
     mutex_init(&fib_mutex);
+    mutex_init(&cal_mutex);
 
     // Let's register the device
     // This will dynamically allocate the major number
